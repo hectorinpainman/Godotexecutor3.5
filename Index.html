@@ -49,13 +49,19 @@ const idb = async (mode, fn) => {
 (async () => {
   try {
     const saved = await idb('readonly', s => s.get('pck'));
-    if (saved) { $('pick').style.display = 'none'; status('Saved .pck found (' + (saved.size/1048576|0) + ' MB).'); }
-    else status('Choose your Brotato .pck file.');
-  } catch (e) { status('Storage unavailable; you will need to pick the file each time.'); }
+    if (saved) {
+      $('pick').style.display = 'none';
+      status('Saved .pck found (' + (saved.size / 1048576 | 0) + ' MB).');
+    } else {
+      status('Choose your Brotato .pck file.');
+    }
+  } catch (e) {
+    status('Storage unavailable; you will need to pick the file each time.');
+  }
 })();
 
 $('forget').onclick = async () => {
-  await idb('readwrite', s => s.delete('pck'));
+  try { await idb('readwrite', s => s.delete('pck')); } catch (e) {}
   $('pick').style.display = '';
   status('Removed. Choose a .pck file.');
 };
@@ -70,14 +76,14 @@ $('play').onclick = async () => {
   }
   if (!blob) return status('No .pck selected.');
 
+  const canvas = $('canvas');
   status('Loading engine...');
   const engine = new Engine();
   try {
-    await engine.init('godot');                       // loads godot.wasm
+    await engine.init('godot');
     status('Loading game data...');
     await engine.preloadFile(await blob.arrayBuffer(), 'game.pck');
     $('setup').style.display = 'none';
-    const canvas = $('canvas');
     canvas.style.display = 'block';
     await engine.start({ canvas, args: ['--main-pack', 'game.pck'] });
   } catch (e) {
