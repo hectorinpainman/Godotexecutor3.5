@@ -7,12 +7,85 @@
 <title>Brotato</title>
 <style>
   html, body { margin:0; height:100%; background:#111; color:#eee; font-family:system-ui,sans-serif; }
-  #setup { max-width:420px; margin:12vh auto; padding:0 20px; text-align:center; }
+  #setup { max-width:420px; margin:10vh auto; padding:0 20px; text-align:center; }
   button, input { font-size:16px; margin:6px 0; }
   button { padding:10px 18px; }
   #canvas { display:none; width:100%; height:100%; }
   #status { margin-top:12px; font-size:14px; opacity:.8; white-space:pre-wrap; }
+  #dbgbox { margin-top:28px; opacity:.6; }
+  #dbgbox input { width:120px; padding:6px; background:#222; color:#eee; border:1px solid #444; border-radius:6px; text-align:center; }
+
+  #dbg { display:none; position:fixed; left:0; right:0; bottom:0; height:45%; z-index:9999;
+         background:rgba(0,0,0,.92); color:#cfc; border-top:2px solid #4a4; flex-direction:column; }
+  #dbg.open { display:flex; }
+  #dbgbar { display:flex; gap:8px; align-items:center; padding:6px 10px; background:#122; font:14px system-ui; color:#eee; }
+  #dbgbar span { flex:1; }
+  #dbgbar button { margin:0; padding:6px 12px; font-size:14px; }
+  #dbglog { flex:1; overflow:auto; margin:0; padding:8px 10px; font:12px/1.35 ui-monospace,Menlo,monospace;
+            white-space:pre-wrap; word-break:break-word; -webkit-overflow-scrolling:touch; }
+  .l-error { color:#f66; } .l-warn { color:#fc6; } .l-godot { color:#8cf; } .l-net { color:#aaa; } .l-info { color:#cfc; }
 </style>
+<script>
+/* ===== Debug logger: installed first so it catches everything ===== */
+window.DBG = (function () {
+  const lines = [];
+  const MAX = 2000;
+  let el = null;
+  const ts = () => ((performance.now() / 1000).toFixed(2) + 's');
+  const str = a => {
+    if (a instanceof Error) return a.stack || (a.name + ': ' + a.message);
+    if (typeof a === 'object' && a !== null) { try { return JSON.stringify(a); } catch (e) { return String(a); } }
+    return String(a);
+  };
+  function add(level, args) {
+    const text = '[' + ts() + '] ' + Array.prototype.map.call(args, str).join(' ');
+    lines.push({ level, text });
+    if (lines.length > MAX) lines.shift();
+    if (el) {
+      const d = document.createElement('div');
+      d.className = 'l-' + level; d.textContent = text;
+      el.appendChild(d);
+      while (el.childNodes.length > MAX) el.removeChild(el.firstChild);
+      el.scrollTop = el.scrollHeight;
+    }
+  }
+  return {
+    log: (level, ...a) => add(level, a),
+    attach(node) {
+      el = node; el.textContent = '';
+      lines.forEach(l => { const d = document.createElement('div'); d.className = 'l-' + l.level; d.textContent = l.text; el.appendChild(d); });
+      el.scrollTop = el.scrollHeight;
+    },
+    clear() { lines.length = 0; if (el) el.textContent = ''; },
+    dump() { return lines.map(l => l.text).join('\n'); }
+  };
+})();
+
+['log', 'info', 'warn', 'error', 'debug'].forEach(k => {
+  const orig = console[k] ? console[k].bind(console) : () => {};
+  const lvl = k === 'error' ? 'error' : k === 'warn' ? 'warn' : 'info';
+  console[k] = function () { orig.apply(null, arguments); DBG.log(lvl, ...arguments); };
+});
+window.addEventListener('error', e => {
+  if (e.target && e.target !== window && (e.target.src || e.target.href)) {
+    DBG.log('error', 'RESOURCE FAILED TO LOAD:', e.target.src || e.target.href);
+  } else {
+    DBG.log('error', 'JS ERROR:', e.message, '@', (e.filename || '').split('/').pop() + ':' + e.lineno + ':' + e.colno, e.error || '');
+  }
+}, true);
+window.addEventListener('unhandledrejection', e => DBG.log('error', 'UNHANDLED PROMISE REJECTION:', e.reason));
+
+if (window.fetch) {
+  const of = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    const url = typeof input === 'string' ? input : (input && input.url);
+    return of(input, init).then(r => {
+      DBG.log(r.ok ? 'net' : 'error', 'fetch', (init && init.method) || 'GET', url, '->', r.status);
+      return r;
+    }, err => { DBG.log('error', 'fetch FAILED', url, err); throw err; });
+  };
+}
+</script>
 <script src="godot.js"></script>
 </head>
 <body>
@@ -22,14 +95,91 @@
   <button id="play">Play</button><br>
   <button id="forget">Remove saved .pck</button>
   <div id="status"></div>
+  <div id="dbgbox"><input id="dbgin" placeholder="type: debug" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></div>
 </div>
 <canvas id="canvas" tabindex="0"></canvas>
 
+<div id="dbg">
+  <div id="dbgbar">
+    <span>Debug console</span>
+    <button id="dbgcopy">Copy</button>
+    <button id="dbgclear">Clear</button>
+    <button id="dbgclose">Close</button>
+  </div>
+  <div id="dbglog"></div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
-const status = t => $('status').textContent = t;
+const setStatus = t => { $('status').textContent = t; DBG.log('info', 'STATUS:', t); };
 
-// ---- tiny IndexedDB wrapper for caching the .pck Blob ----
+/* ===== Debug panel open/close ===== */
+function openDebug() { $('dbg').classList.add('open'); DBG.attach($('dbglog')); }
+function closeDebug() { $('dbg').classList.remove('open'); }
+$('dbgclose').onclick = closeDebug;
+$('dbgclear').onclick = () => DBG.clear();
+$('dbgcopy').onclick = async () => {
+  try { await navigator.clipboard.writeText(DBG.dump()); $('dbgcopy').textContent = 'Copied!'; }
+  catch (e) {
+    const r = document.createRange(); r.selectNodeContents($('dbglog'));
+    const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+    $('dbgcopy').textContent = 'Selected - tap Copy in menu';
+  }
+  setTimeout(() => $('dbgcopy').textContent = 'Copy', 2000);
+};
+
+// 1) type "debug" in the box + Enter
+$('dbgin').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { if ($('dbgin').value.trim().toLowerCase() === 'debug') openDebug(); $('dbgin').value = ''; }
+});
+// 2) type "debug" anywhere on a keyboard
+let typed = '';
+window.addEventListener('keydown', e => {
+  if (!e.key || e.key.length !== 1) return;
+  typed = (typed + e.key.toLowerCase()).slice(-5);
+  if (typed === 'debug') { typed = ''; openDebug(); }
+}, true);
+// 3) #debug in the URL
+if (/debug/i.test(location.hash) || /[?&]debug/i.test(location.search)) openDebug();
+// 4) tap top-left corner 5 times
+let taps = [];
+window.addEventListener('pointerdown', e => {
+  if (e.clientX < 70 && e.clientY < 70) {
+    const n = Date.now(); taps = taps.filter(t => n - t < 2000); taps.push(n);
+    if (taps.length >= 5) { taps = []; openDebug(); }
+  }
+}, true);
+
+/* ===== Startup diagnostics ===== */
+(async function diagnostics() {
+  DBG.log('info', '--- Environment ---');
+  DBG.log('info', 'URL:', location.href);
+  DBG.log('info', 'UA:', navigator.userAgent);
+  DBG.log('info', 'WebAssembly:', typeof WebAssembly !== 'undefined');
+  DBG.log('info', 'SharedArrayBuffer:', typeof SharedArrayBuffer !== 'undefined', '| crossOriginIsolated:', window.crossOriginIsolated);
+  DBG.log('info', 'Engine defined (godot.js loaded):', typeof Engine !== 'undefined');
+  if (navigator.deviceMemory) DBG.log('info', 'deviceMemory (GB, capped):', navigator.deviceMemory);
+  try {
+    const c = document.createElement('canvas');
+    DBG.log('info', 'WebGL2:', !!c.getContext('webgl2'), '| WebGL1:', !!document.createElement('canvas').getContext('webgl'));
+  } catch (e) { DBG.log('error', 'WebGL check failed', e); }
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const s = await navigator.storage.estimate();
+      DBG.log('info', 'Storage used/quota (MB):', (s.usage / 1048576 | 0), '/', (s.quota / 1048576 | 0));
+    }
+  } catch (e) {}
+  DBG.log('info', '--- File check (HEAD) ---');
+  for (const f of ['godot.js', 'godot.wasm', 'godot.audio.worklet.js']) {
+    try {
+      const r = await fetch(f, { method: 'HEAD', cache: 'no-store' });
+      DBG.log(r.ok ? 'info' : 'error', f, '->', r.status, r.headers.get('content-type') || '', (r.headers.get('content-length') || '?') + ' bytes');
+    } catch (e) { DBG.log('error', f, 'unreachable', e); }
+  }
+  DBG.log('info', '--- Ready ---');
+})();
+
+/* ===== tiny IndexedDB wrapper for caching the .pck Blob ===== */
 const db = () => new Promise((res, rej) => {
   const r = indexedDB.open('brotato-loader', 1);
   r.onupgradeneeded = () => r.result.createObjectStore('files');
@@ -51,46 +201,72 @@ const idb = async (mode, fn) => {
     const saved = await idb('readonly', s => s.get('pck'));
     if (saved) {
       $('pick').style.display = 'none';
-      status('Saved .pck found (' + (saved.size / 1048576 | 0) + ' MB).');
+      setStatus('Saved .pck found (' + (saved.size / 1048576 | 0) + ' MB).');
     } else {
-      status('Choose your Brotato .pck file.');
+      setStatus('Choose your Brotato .pck file.');
     }
   } catch (e) {
-    status('Storage unavailable; you will need to pick the file each time.');
+    console.error('IndexedDB read failed', e);
+    setStatus('Storage unavailable; you will need to pick the file each time.');
   }
 })();
 
 $('forget').onclick = async () => {
-  try { await idb('readwrite', s => s.delete('pck')); } catch (e) {}
+  try { await idb('readwrite', s => s.delete('pck')); } catch (e) { console.error(e); }
   $('pick').style.display = '';
-  status('Removed. Choose a .pck file.');
+  setStatus('Removed. Choose a .pck file.');
 };
 
 $('play').onclick = async () => {
   let blob = null;
-  try { blob = await idb('readonly', s => s.get('pck')); } catch (e) {}
+  try { blob = await idb('readonly', s => s.get('pck')); } catch (e) { console.error('cache read failed', e); }
   const f = $('pck').files[0];
   if (f) {
     blob = f;
-    try { await idb('readwrite', s => s.put(f, 'pck')); } catch (e) { console.warn('cache failed', e); }
+    DBG.log('info', 'Picked file:', f.name, (f.size / 1048576).toFixed(1) + ' MB');
+    try { await idb('readwrite', s => s.put(f, 'pck')); DBG.log('info', 'Cached .pck in IndexedDB'); }
+    catch (e) { console.warn('cache failed', e); }
   }
-  if (!blob) return status('No .pck selected.');
+  if (!blob) return setStatus('No .pck selected.');
+
+  if (typeof Engine === 'undefined') {
+    return setStatus('godot.js did not load. Open the debug console (type "debug") and check the file check.');
+  }
 
   const canvas = $('canvas');
-  status('Loading engine...');
-  const engine = new Engine();
+  setStatus('Loading engine...');
+  let lastPct = -1;
+  const engine = new Engine({
+    onProgress: (cur, total) => {
+      if (!total) return;
+      const p = Math.floor(cur / total * 10) * 10;
+      if (p !== lastPct) { lastPct = p; DBG.log('net', 'Engine download progress:', p + '%'); }
+    },
+    onPrint: (...a) => DBG.log('godot', 'GODOT:', ...a),
+    onPrintError: (...a) => DBG.log('error', 'GODOT ERR:', ...a)
+  });
   try {
+    DBG.log('info', 'engine.init("godot")');
     await engine.init('godot');
-    status('Loading game data...');
-    await engine.preloadFile(await blob.arrayBuffer(), 'game.pck');
+    setStatus('Loading game data...');
+    DBG.log('info', 'Reading .pck into memory...');
+    const buf = await blob.arrayBuffer();
+    DBG.log('info', 'preloadFile game.pck,', (buf.byteLength / 1048576).toFixed(1) + ' MB');
+    await engine.preloadFile(buf, 'game.pck');
     $('setup').style.display = 'none';
     canvas.style.display = 'block';
-    await engine.start({ canvas, args: ['--main-pack', 'game.pck'] });
+    DBG.log('info', 'engine.start --main-pack game.pck');
+    await engine.start({
+      canvas,
+      args: ['--main-pack', 'game.pck'],
+      onExit: code => DBG.log('warn', 'Engine exited with code', code)
+    });
+    DBG.log('info', 'engine.start resolved (game running)');
   } catch (e) {
     $('setup').style.display = '';
     canvas.style.display = 'none';
-    status('Error: ' + e);
-    console.error(e);
+    console.error('Launch failed:', e);
+    setStatus('Error: ' + e + '\n(Type "debug" below for details)');
   }
 };
 </script>
