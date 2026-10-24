@@ -15,6 +15,9 @@
   #dbgbox { margin-top:28px; opacity:.6; }
   #dbgbox input { width:120px; padding:6px; background:#222; color:#eee; border:1px solid #444; border-radius:6px; text-align:center; }
 
+  #hud { position:fixed; top:env(safe-area-inset-top,0px); right:0; z-index:10000; font:11px ui-monospace,Menlo,monospace;
+         background:rgba(0,0,0,.65); color:#9f9; padding:3px 7px; border-bottom-left-radius:6px; }
+
   #dbg { display:none; position:fixed; left:0; right:0; bottom:0; height:45%; z-index:9999;
          background:rgba(0,0,0,.92); color:#cfc; border-top:2px solid #4a4; flex-direction:column; }
   #dbg.open { display:flex; }
@@ -27,16 +30,28 @@
 </style>
 <script>
 /* ===== Debug logger: installed first so it catches everything ===== */
+window.__step = 'idle';
 window.DBG = (function () {
+  const KEY = 'dbg-last';
   const lines = [];
   const MAX = 2000;
-  let el = null;
+  let el = null, timer = null, prev = null;
+  try { prev = JSON.parse(localStorage.getItem(KEY) || 'null'); } catch (e) {}   // read BEFORE we overwrite it
+
   const ts = () => ((performance.now() / 1000).toFixed(2) + 's');
   const str = a => {
     if (a instanceof Error) return a.stack || (a.name + ': ' + a.message);
     if (typeof a === 'object' && a !== null) { try { return JSON.stringify(a); } catch (e) { return String(a); } }
     return String(a);
   };
+  function save() {
+    timer = null;
+    try {
+      localStorage.setItem(KEY, JSON.stringify({
+        step: window.__step, saved: Date.now(), lines: lines.slice(-150).map(l => l.text)
+      }));
+    } catch (e) {}
+  }
   function add(level, args) {
     const text = '[' + ts() + '] ' + Array.prototype.map.call(args, str).join(' ');
     lines.push({ level, text });
@@ -48,9 +63,12 @@ window.DBG = (function () {
       while (el.childNodes.length > MAX) el.removeChild(el.firstChild);
       el.scrollTop = el.scrollHeight;
     }
+    if (!timer) timer = setTimeout(save, 700);
   }
   return {
+    prev,
     log: (level, ...a) => add(level, a),
+    saveNow: save,
     attach(node) {
       el = node; el.textContent = '';
       lines.forEach(l => { const d = document.createElement('div'); d.className = 'l-' + l.level; d.textContent = l.text; el.appendChild(d); });
@@ -79,16 +97,54 @@ if (window.fetch) {
   const of = window.fetch.bind(window);
   window.fetch = function (input, init) {
     const url = typeof input === 'string' ? input : (input && input.url);
+    const quiet = init && init.method === 'HEAD';
     return of(input, init).then(r => {
-      DBG.log(r.ok ? 'net' : 'error', 'fetch', (init && init.method) || 'GET', url, '->', r.status);
+      if (!quiet) DBG.log(r.ok ? 'net' : 'error', 'fetch', (init && init.method) || 'GET', url, '->', r.status);
       return r;
-    }, err => { DBG.log('error', 'fetch FAILED', url, err); throw err; });
+    }, err => { if (!quiet) DBG.log('error', 'fetch FAILED', url, err); throw err; });
   };
 }
+
+/* ===== WebAssembly memory tracking (must run before godot.js) ===== */
+try {
+  const OrigMem = WebAssembly.Memory;
+  const mb = n => (n / 1048576).toFixed(0) + ' MB';
+  WebAssembly.Memory = function (desc) {
+    const m = new OrigMem(desc);
+    window.__mem = m;
+    DBG.log('info', 'WASM memory created: initial', mb(desc.initial * 65536),
+            '| maximum', desc.maximum ? mb(desc.maximum * 65536) : 'none', desc.shared ? '| shared' : '');
+    return m;
+  };
+  WebAssembly.Memory.prototype = OrigMem.prototype;
+  const origGrow = OrigMem.prototype.grow;
+  OrigMem.prototype.grow = function (pages) {
+    const before = this.buffer.byteLength;
+    try {
+      const r = origGrow.call(this, pages);
+      DBG.log('info', 'WASM memory grew', mb(before), '->', mb(this.buffer.byteLength));
+      return r;
+    } catch (e) {
+      DBG.log('error', 'WASM MEMORY GROW FAILED: was', mb(before), '| tried to add', mb(pages * 65536), '|', e);
+      throw e;
+    }
+  };
+} catch (e) { DBG.log('warn', 'Could not hook WebAssembly.Memory', e); }
+
+/* ===== Report what happened in the previous session (survives a tab crash) ===== */
+if (DBG.prev) {
+  const p = DBG.prev;
+  const ago = Math.round((Date.now() - p.saved) / 1000);
+  const abnormal = p.step && p.step !== 'idle' && p.step !== 'running';
+  DBG.log(abnormal ? 'error' : 'info',
+    'PREVIOUS SESSION: last step was "' + p.step + '", last log ' + ago + 's before this page loaded' +
+    (abnormal ? ' -> it probably CRASHED or was killed by iOS during that step' : ''));
+  if (abnormal) (p.lines || []).slice(-40).forEach(t => DBG.log('warn', '  prev>', t));
+}
 </script>
-<script src="godot.js"></script>
 </head>
 <body>
+<div id="hud">0s | idle | n/a</div>
 <div id="setup">
   <h1>Brotato</h1>
   <div id="pick"><input type="file" id="pck"><br></div>
@@ -102,6 +158,7 @@ if (window.fetch) {
 <div id="dbg">
   <div id="dbgbar">
     <span>Debug console</span>
+    <button id="dbgprev">Prev</button>
     <button id="dbgcopy">Copy</button>
     <button id="dbgclear">Clear</button>
     <button id="dbgclose">Close</button>
@@ -110,14 +167,57 @@ if (window.fetch) {
 </div>
 
 <script>
+/* ---- SETTING: where are godot.js / godot.wasm / godot.audio.worklet.js? ----
+   ''     = in the repo root
+   '3.7'  = inside a /3.7/ folder                                            */
+const RUNTIME_DIR = '';
+const RT = RUNTIME_DIR ? RUNTIME_DIR + '/' : '';
+
 const $ = id => document.getElementById(id);
 const setStatus = t => { $('status').textContent = t; DBG.log('info', 'STATUS:', t); };
+const memMB = () => window.__mem ? ((window.__mem.buffer.byteLength / 1048576) | 0) + ' MB' : 'n/a';
 
-/* ===== Debug panel open/close ===== */
+let stepStart = performance.now();
+function setStep(s) {
+  window.__step = s; stepStart = performance.now();
+  DBG.log('info', 'STEP:', s);
+  DBG.saveNow();
+}
+
+/* ===== Heartbeat: detects freezes, drives the HUD ===== */
+let lastBeat = performance.now(), lastStillNotice = 0;
+setInterval(() => {
+  const now = performance.now();
+  const gap = now - lastBeat; lastBeat = now;
+  const visible = document.visibilityState === 'visible';
+  if (visible && gap > 1500) {
+    DBG.log('warn', 'MAIN THREAD STALLED for ' + (gap / 1000).toFixed(1) + 's (step: ' + window.__step + ', wasm mem: ' + memMB() + ')');
+  }
+  const inStep = Math.floor((now - stepStart) / 10000);
+  if (visible && window.__step !== 'idle' && window.__step !== 'running' && inStep >= 2 && inStep !== lastStillNotice) {
+    lastStillNotice = inStep;
+    DBG.log('warn', 'Still in step "' + window.__step + '" after ' + Math.round((now - stepStart) / 1000) + 's (wasm mem: ' + memMB() + ')');
+  }
+  $('hud').textContent = Math.round(now / 1000) + 's | ' + window.__step + ' | ' + memMB();
+}, 500);
+$('hud').onclick = () => openDebug();
+
+document.addEventListener('visibilitychange', () => DBG.log('info', 'visibility:', document.visibilityState));
+window.addEventListener('pagehide', () => { DBG.log('warn', 'pagehide'); DBG.saveNow(); });
+window.addEventListener('pageshow', e => DBG.log('info', 'pageshow (from bfcache: ' + e.persisted + ')'));
+
+/* ===== Debug panel ===== */
 function openDebug() { $('dbg').classList.add('open'); DBG.attach($('dbglog')); }
 function closeDebug() { $('dbg').classList.remove('open'); }
 $('dbgclose').onclick = closeDebug;
 $('dbgclear').onclick = () => DBG.clear();
+$('dbgprev').onclick = () => {
+  const p = DBG.prev;
+  if (!p) return DBG.log('info', 'No previous session log stored.');
+  DBG.log('info', '--- PREVIOUS SESSION (last step "' + p.step + '") ---');
+  (p.lines || []).forEach(t => DBG.log('warn', 'prev>', t));
+  DBG.log('info', '--- END PREVIOUS ---');
+};
 $('dbgcopy').onclick = async () => {
   try { await navigator.clipboard.writeText(DBG.dump()); $('dbgcopy').textContent = 'Copied!'; }
   catch (e) {
@@ -127,21 +227,16 @@ $('dbgcopy').onclick = async () => {
   }
   setTimeout(() => $('dbgcopy').textContent = 'Copy', 2000);
 };
-
-// 1) type "debug" in the box + Enter
 $('dbgin').addEventListener('keydown', e => {
   if (e.key === 'Enter') { if ($('dbgin').value.trim().toLowerCase() === 'debug') openDebug(); $('dbgin').value = ''; }
 });
-// 2) type "debug" anywhere on a keyboard
 let typed = '';
 window.addEventListener('keydown', e => {
   if (!e.key || e.key.length !== 1) return;
   typed = (typed + e.key.toLowerCase()).slice(-5);
   if (typed === 'debug') { typed = ''; openDebug(); }
 }, true);
-// 3) #debug in the URL
 if (/debug/i.test(location.hash) || /[?&]debug/i.test(location.search)) openDebug();
-// 4) tap top-left corner 5 times
 let taps = [];
 window.addEventListener('pointerdown', e => {
   if (e.clientX < 70 && e.clientY < 70) {
@@ -150,6 +245,16 @@ window.addEventListener('pointerdown', e => {
   }
 }, true);
 
+/* ===== Load the engine script ===== */
+const runtimeReady = new Promise((res, rej) => {
+  const s = document.createElement('script');
+  s.src = RT + 'godot.js';
+  s.onload = res;
+  s.onerror = () => rej(new Error('Could not load ' + s.src));
+  document.head.appendChild(s);
+});
+runtimeReady.catch(e => DBG.log('error', String(e)));
+
 /* ===== Startup diagnostics ===== */
 (async function diagnostics() {
   DBG.log('info', '--- Environment ---');
@@ -157,11 +262,11 @@ window.addEventListener('pointerdown', e => {
   DBG.log('info', 'UA:', navigator.userAgent);
   DBG.log('info', 'WebAssembly:', typeof WebAssembly !== 'undefined');
   DBG.log('info', 'SharedArrayBuffer:', typeof SharedArrayBuffer !== 'undefined', '| crossOriginIsolated:', window.crossOriginIsolated);
-  DBG.log('info', 'Engine defined (godot.js loaded):', typeof Engine !== 'undefined');
   if (navigator.deviceMemory) DBG.log('info', 'deviceMemory (GB, capped):', navigator.deviceMemory);
+  if (performance.memory) DBG.log('info', 'JS heap limit (MB):', (performance.memory.jsHeapSizeLimit / 1048576) | 0);
   try {
-    const c = document.createElement('canvas');
-    DBG.log('info', 'WebGL2:', !!c.getContext('webgl2'), '| WebGL1:', !!document.createElement('canvas').getContext('webgl'));
+    DBG.log('info', 'WebGL2:', !!document.createElement('canvas').getContext('webgl2'),
+            '| WebGL1:', !!document.createElement('canvas').getContext('webgl'));
   } catch (e) { DBG.log('error', 'WebGL check failed', e); }
   try {
     if (navigator.storage && navigator.storage.estimate) {
@@ -172,14 +277,14 @@ window.addEventListener('pointerdown', e => {
   DBG.log('info', '--- File check (HEAD) ---');
   for (const f of ['godot.js', 'godot.wasm', 'godot.audio.worklet.js']) {
     try {
-      const r = await fetch(f, { method: 'HEAD', cache: 'no-store' });
-      DBG.log(r.ok ? 'info' : 'error', f, '->', r.status, r.headers.get('content-type') || '', (r.headers.get('content-length') || '?') + ' bytes');
-    } catch (e) { DBG.log('error', f, 'unreachable', e); }
+      const r = await fetch(RT + f, { method: 'HEAD', cache: 'no-store' });
+      DBG.log(r.ok ? 'info' : 'error', RT + f, '->', r.status, r.ok ? ((r.headers.get('content-length') || '?') + ' bytes') : '');
+    } catch (e) { DBG.log('error', RT + f, 'unreachable', e); }
   }
   DBG.log('info', '--- Ready ---');
 })();
 
-/* ===== tiny IndexedDB wrapper for caching the .pck Blob ===== */
+/* ===== IndexedDB cache for the .pck ===== */
 const db = () => new Promise((res, rej) => {
   const r = indexedDB.open('brotato-loader', 1);
   r.onupgradeneeded = () => r.result.createObjectStore('files');
@@ -217,7 +322,30 @@ $('forget').onclick = async () => {
   setStatus('Removed. Choose a .pck file.');
 };
 
+/* ===== Read engine version from the .pck header (info only) ===== */
+async function logPackHeader(blob) {
+  try {
+    const b = await blob.slice(0, 20).arrayBuffer();
+    const magic = String.fromCharCode(...new Uint8Array(b, 0, 4));
+    if (magic !== 'GDPC') return DBG.log('warn', 'No GDPC header at start of file (embedded pck or wrong file?)');
+    const v = new DataView(b);
+    DBG.log('info', 'Pack header: format', v.getUint32(4, true), '| engine',
+            v.getUint32(8, true) + '.' + v.getUint32(12, true) + '.' + v.getUint32(16, true));
+  } catch (e) { DBG.log('warn', 'Header read failed', e); }
+}
+
+let busy = false;
 $('play').onclick = async () => {
+  if (busy) return;
+  busy = true;
+  try { await play(); } finally { busy = false; }
+};
+
+async function play() {
+  const t0 = performance.now();
+  const lap = name => DBG.log('info', '  [' + name + '] done,', ((performance.now() - t0) / 1000).toFixed(1) + 's since Play');
+
+  setStep('choosing .pck');
   let blob = null;
   try { blob = await idb('readonly', s => s.get('pck')); } catch (e) { console.error('cache read failed', e); }
   const f = $('pck').files[0];
@@ -227,48 +355,69 @@ $('play').onclick = async () => {
     try { await idb('readwrite', s => s.put(f, 'pck')); DBG.log('info', 'Cached .pck in IndexedDB'); }
     catch (e) { console.warn('cache failed', e); }
   }
-  if (!blob) return setStatus('No .pck selected.');
-
-  if (typeof Engine === 'undefined') {
-    return setStatus('godot.js did not load. Open the debug console (type "debug") and check the file check.');
-  }
+  if (!blob) { setStep('idle'); return setStatus('No .pck selected.'); }
+  await logPackHeader(blob);
 
   const canvas = $('canvas');
-  setStatus('Loading engine...');
-  let lastPct = -1;
-  const engine = new Engine({
-    onProgress: (cur, total) => {
-      if (!total) return;
-      const p = Math.floor(cur / total * 10) * 10;
-      if (p !== lastPct) { lastPct = p; DBG.log('net', 'Engine download progress:', p + '%'); }
-    },
-    onPrint: (...a) => DBG.log('godot', 'GODOT:', ...a),
-    onPrintError: (...a) => DBG.log('error', 'GODOT ERR:', ...a)
-  });
+  canvas.addEventListener('webglcontextlost', () => DBG.log('error', 'WEBGL CONTEXT LOST (GPU or memory pressure?)'), false);
+  canvas.addEventListener('webglcontextcreationerror', e => DBG.log('error', 'WebGL context creation error:', e.statusMessage || ''), false);
+
   try {
-    DBG.log('info', 'engine.init("godot")');
-    await engine.init('godot');
+    setStep('loading engine script');
+    await runtimeReady;
+    if (typeof Engine === 'undefined') throw new Error('godot.js loaded but Engine is undefined');
+    lap('engine script');
+
+    let lastPct = -1;
+    const engine = new Engine({
+      canvas,
+      onProgress: (cur, total) => {
+        if (!total) return;
+        const p = Math.floor(cur / total * 10) * 10;
+        if (p !== lastPct) { lastPct = p; DBG.log('net', 'Engine download progress:', p + '%'); }
+      },
+      onPrint: (...a) => DBG.log('godot', 'GODOT:', ...a),
+      onPrintError: (...a) => DBG.log('error', 'GODOT ERR:', ...a)
+    });
+
+    setStep('engine.init (wasm)');
+    setStatus('Loading engine...');
+    await engine.init(RT + 'godot');
+    lap('engine.init');
+
+    setStep('reading .pck into memory');
     setStatus('Loading game data...');
-    DBG.log('info', 'Reading .pck into memory...');
-    const buf = await blob.arrayBuffer();
-    DBG.log('info', 'preloadFile game.pck,', (buf.byteLength / 1048576).toFixed(1) + ' MB');
+    let buf;
+    try { buf = await blob.arrayBuffer(); }
+    catch (e) {
+      throw new Error('Could not read .pck into memory (' + e + '). Likely out of memory, or the file is an iCloud placeholder that has not finished downloading.');
+    }
+    DBG.log('info', 'Read', (buf.byteLength / 1048576).toFixed(1) + ' MB (blob.size', (blob.size / 1048576).toFixed(1) + ' MB) | wasm mem:', memMB());
+    lap('read .pck');
+
+    setStep('preloading .pck into engine');
     await engine.preloadFile(buf, 'game.pck');
+    buf = null;
+    lap('preloadFile');
+
     $('setup').style.display = 'none';
     canvas.style.display = 'block';
-    DBG.log('info', 'engine.start --main-pack game.pck');
+    setStep('engine.start (game booting)');
     await engine.start({
       canvas,
       args: ['--main-pack', 'game.pck'],
       onExit: code => DBG.log('warn', 'Engine exited with code', code)
     });
-    DBG.log('info', 'engine.start resolved (game running)');
+    lap('engine.start');
+    setStep('running');
   } catch (e) {
+    setStep('failed');
     $('setup').style.display = '';
     canvas.style.display = 'none';
     console.error('Launch failed:', e);
-    setStatus('Error: ' + e + '\n(Type "debug" below for details)');
+    setStatus('Error: ' + e + '\nReload the page before trying again.\n(Tap the green badge, top right, for details)');
   }
-};
+}
 </script>
 </body>
 </html>
